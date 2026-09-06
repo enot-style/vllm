@@ -11,6 +11,16 @@ from vllm.platforms.interface import Platform
 class _Backend:
     @classmethod
     def customize_spec(cls, spec):
+        # Triton packs each INT4 K/V element into half a byte and appends one
+        # FP32 scale per head to each of K and V. Keep the backend contract
+        # explicit so this test isolates platform-side layer selection.
+        if spec.dtype == torch.uint8:
+            return SimpleNamespace(
+                page_size_bytes=(
+                    spec.num_kv_heads * spec.head_size
+                    + spec.num_kv_heads * 2 * torch.float32.itemsize
+                )
+            )
         return spec
 
     @classmethod
