@@ -687,33 +687,91 @@ class Platform:
         if not model_config:
             return
 
-        def per_token_page_bytes(dtype: "torch.dtype", cache_dtype: str) -> int:
+        def per_token_page_bytes(
+            dtype: "torch.dtype", cache_dtype: str, layer_idx: int | None = None
+        ) -> int:
             """Bytes one token occupies in one layer, for the given dtype."""
+            arch_config = (
+                model_config.model_arch_config[layer_idx]
+                if layer_idx is not None
+                else model_config.model_arch_config
+            )
             spec = FullAttentionSpec(
                 block_size=1,
-                num_kv_heads=model_config.get_num_kv_heads(parallel_config),
-                head_size=model_config.get_head_size(),
+                num_kv_heads=model_config.get_num_kv_heads(
+                    parallel_config, arch_config
+                ),
+                head_size=arch_config.head_size,
                 dtype=dtype,
                 kv_quant_mode=get_kv_quant_mode(cache_dtype),
             )
             # The backend owns its packing
             return backend_cls.customize_spec(spec).page_size_bytes
 
+        skip_patterns = set(cache_config.kv_cache_dtype_skip_layers)
+        layer_types = getattr(model_config.hf_text_config, "layer_types", None)
+        num_layers = model_config.get_total_num_hidden_layers()
+
+        def layer_is_skipped(layer_idx: int) -> bool:
+            if str(layer_idx) in skip_patterns:
+                return True
+            return bool(
+                "sliding_window" in skip_patterns
+                and layer_types is not None
+                and layer_idx < len(layer_types)
+                and layer_types[layer_idx] in ("sliding_attention", "sliding_window")
+            )
+
+        skipped_layers = [i for i in range(num_layers) if layer_is_skipped(i)]
+        primary_layers = [i for i in range(num_layers) if not layer_is_skipped(i)]
+        # Some model families do not expose per-layer attention types. Retain
+        # the conservative whole-model sizing for symbolic skip selectors in
+        # that case. Explicit numeric selectors are always resolved above.
+        unresolved_symbolic_skip = any(
+            not pattern.isdecimal() for pattern in skip_patterns
+        ) and not skipped_layers
+
         primary_dtype = (
             STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
             if cache_config.cache_dtype != "auto"
             else model_config.dtype
         )
-        primary_page = per_token_page_bytes(primary_dtype, cache_config.cache_dtype)
+        if primary_layers and not unresolved_symbolic_skip:
+            primary_page = max(
+                per_token_page_bytes(
+                    primary_dtype, cache_config.cache_dtype, layer_idx
+                )
+                for layer_idx in primary_layers
+            )
+        else:
+            primary_page = per_token_page_bytes(
+                primary_dtype, cache_config.cache_dtype
+            )
 
         # Per-token page of every higher-precision padded spec sharing the pool.
         padded_pages: list[int] = []
         if cache_config.kv_cache_dtype_skip_layers:
-            padded_pages.append(per_token_page_bytes(model_config.dtype, "auto"))
+            if skipped_layers and not unresolved_symbolic_skip:
+                padded_pages.extend(
+                    per_token_page_bytes(model_config.dtype, "auto", layer_idx)
+                    for layer_idx in skipped_layers
+                )
+            else:
+                padded_pages.append(
+                    per_token_page_bytes(model_config.dtype, "auto")
+                )
         # To add the first/last-N sibling:
         #   padded_pages.append(per_token_page_bytes(<sibling_dtype>, "auto"))
         if not padded_pages:
             return
+
+        logger.info(
+            "Layer-aware heterogeneous KV sizing: primary=%dB/token, "
+            "largest skipped=%dB/token, resolved skipped layers=%s",
+            primary_page,
+            max(padded_pages),
+            skipped_layers if not unresolved_symbolic_skip else "unknown",
+        )
 
         largest_padded_page = max(padded_pages)
         assert largest_padded_page >= primary_page, (
